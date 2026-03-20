@@ -1,0 +1,349 @@
+{
+  "name": "Тур Агент — ВК + Макс",
+  "nodes": [
+    {
+      "name": "Настройки",
+      "type": "n8n-nodes-base.set",
+      "position": [250, 300],
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "USE_TOURVISOR",
+              "value": "false"
+            },
+            {
+              "name": "TOURVISOR_WEBHOOK",
+              "value": "https://ВАШ-АДРЕС.railway.app/search"
+            },
+            {
+              "name": "CLAUDE_MODEL",
+              "value": "claude-sonnet-4-20250514"
+            },
+            {
+              "name": "MANAGER_VK_ID",
+              "value": "ВАШ_VK_ID_МЕНЕДЖЕРА"
+            }
+          ]
+        }
+      },
+      "notes": "⚙️ НАСТРОЙКИ — меняй здесь\n\nUSE_TOURVISOR:\n  false = поиск через веб (сейчас)\n  true  = Tourvisor API (после получения доступа)\n\nMANAGER_VK_ID:\n  ID страницы менеджера в ВК куда слать карточку"
+    },
+    {
+      "name": "Trigger — ВКонтакте",
+      "type": "n8n-nodes-base.webhook",
+      "position": [250, 150],
+      "parameters": {
+        "path": "vk-message",
+        "method": "POST"
+      },
+      "notes": "Подключение:\n1. Скопируй URL этого webhook\n2. В настройках сообщества ВК → API → Callback API\n3. Вставь URL, выбери событие 'message_new'\n4. Секретный ключ вставь в переменную VK_SECRET"
+    },
+    {
+      "name": "Trigger — Макс",
+      "type": "n8n-nodes-base.webhook",
+      "position": [250, 450],
+      "parameters": {
+        "path": "max-message",
+        "method": "POST"
+      },
+      "notes": "Подключение Макс (Mail.ru):\n1. Создай бота на dev.max.ru\n2. Получи токен бота\n3. Настрой webhook на этот URL\n4. Событие: message_created"
+    },
+    {
+      "name": "Нормализация сообщения",
+      "type": "n8n-nodes-base.code",
+      "position": [500, 300],
+      "parameters": {
+        "jsCode": "// Приводим сообщения из разных каналов к единому формату\nconst item = items[0];\nconst body = item.json;\n\nlet userId, text, channel;\n\n// ВКонтакте\nif (body.type === 'message_new' && body.object?.message) {\n  userId = 'vk_' + body.object.message.from_id;\n  text = body.object.message.text;\n  channel = 'vk';\n}\n// Макс (Max.ru)\nelse if (body.message && body.message.body) {\n  userId = 'max_' + body.message.from.user_id;\n  text = body.message.body;\n  channel = 'max';\n}\n// Неизвестный формат\nelse {\n  return [];\n}\n\nif (!text || text.trim() === '') return [];\n\nreturn [{ json: { userId, text, channel, rawBody: body } }];"
+      }
+    },
+    {
+      "name": "Загрузить историю сессии",
+      "type": "n8n-nodes-base.code",
+      "position": [750, 300],
+      "parameters": {
+        "jsCode": "// Загружаем историю диалога для этого пользователя из памяти n8n\n// В продакшне замени на Redis или PostgreSQL для надёжности\nconst userId = items[0].json.userId;\nconst text = items[0].json.text;\nconst channel = items[0].json.channel;\n\n// Глобальная переменная для хранения сессий (в рамках одного запуска n8n)\nif (!global.sessions) global.sessions = {};\nif (!global.sessions[userId]) {\n  global.sessions[userId] = {\n    history: [],\n    stage: 'collecting',\n    tz: {}\n  };\n}\n\nconst session = global.sessions[userId];\n\nreturn [{ json: {\n  userId,\n  text,\n  channel,\n  history: session.history,\n  stage: session.stage,\n  tz: session.tz\n}}];"
+      }
+    },
+    {
+      "name": "Claude — Агент",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1000, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{$env.CLAUDE_API_KEY}}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "claude-sonnet-4-20250514"
+            },
+            {
+              "name": "max_tokens",
+              "value": "2000"
+            },
+            {
+              "name": "system",
+              "value": "=ВСТАВЬ_СЮДА_СИСТЕМНЫЙ_ПРОМПТ_ИЗ_ФАЙЛА_СИСТЕМНЫЙ_ПРОМПТ.md"
+            },
+            {
+              "name": "messages",
+              "value": "={{JSON.parse($json.history).concat([{role:'user',content:$json.text}])}}"
+            }
+          ]
+        },
+        "notes": "⚠️ В поле 'system' вставь полный текст из файла СИСТЕМНЫЙ_ПРОМПТ.md\n\nВ Environment Variables n8n добавь:\nCLAUDE_API_KEY = sk-ant-xxxxxx (ключ с platform.anthropic.com)"
+      }
+    },
+    {
+      "name": "Парсинг ответа Claude",
+      "type": "n8n-nodes-base.code",
+      "position": [1250, 300],
+      "parameters": {
+        "jsCode": "const item = items[0];\nconst response = item.json;\nconst userId = item.json.userId || $('Нормализация сообщения').first().json.userId;\n\n// Получаем текст ответа\nconst content = response.content || [];\nconst agentText = content.filter(b => b.type === 'text').map(b => b.text).join('\\n').trim();\n\n// Проверяем нужен ли поиск туров\nconst searchMatch = agentText.match(/```json([\\s\\S]*?)```/);\nlet searchParams = null;\nif (searchMatch) {\n  try { searchParams = JSON.parse(searchMatch[1].trim()); } catch(e) {}\n}\n\n// Проверяем принял ли клиент решение\nconst isDecision = /передаю вашу заявку менеджеру/i.test(agentText);\n\n// Обновляем историю сессии\nif (!global.sessions) global.sessions = {};\nif (!global.sessions[userId]) global.sessions[userId] = { history: [], stage: 'collecting', tz: {} };\n\nglobal.sessions[userId].history.push(\n  { role: 'user', content: item.json.text },\n  { role: 'assistant', content: agentText }\n);\n\n// Ограничиваем историю (последние 20 сообщений)\nif (global.sessions[userId].history.length > 20) {\n  global.sessions[userId].history = global.sessions[userId].history.slice(-20);\n}\n\n// Чистим JSON-блок из ответа клиенту\nconst cleanText = agentText.replace(/```json[\\s\\S]*?```/g, '').trim();\n\nreturn [{ json: {\n  userId,\n  channel: item.json.channel || 'vk',\n  rawBody: item.json.rawBody,\n  agentText: cleanText,\n  searchParams,\n  isDecision,\n  needSearch: searchParams !== null\n}}];"
+      }
+    },
+    {
+      "name": "Нужен поиск?",
+      "type": "n8n-nodes-base.if",
+      "position": [1500, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.needSearch}}",
+              "value2": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Проверить режим поиска",
+      "type": "n8n-nodes-base.if",
+      "position": [1750, 200],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$env.USE_TOURVISOR || 'false'}}",
+              "value2": "true"
+            }
+          ]
+        }
+      },
+      "notes": "true → Tourvisor API\nfalse → Веб-поиск через Claude"
+    },
+    {
+      "name": "Поиск через Tourvisor API",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2000, 100],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.TOURVISOR_WEBHOOK}}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "departure",
+              "value": "={{$('Парсинг ответа Claude').first().json.searchParams.departure}}"
+            },
+            {
+              "name": "country",
+              "value": "={{$('Парсинг ответа Claude').first().json.searchParams.country}}"
+            },
+            {
+              "name": "datefrom",
+              "value": "={{$('Парсинг ответа Claude').first().json.searchParams.datefrom}}"
+            },
+            {
+              "name": "dateto",
+              "value": "={{$('Парсинг ответа Claude').first().json.searchParams.dateto}}"
+            },
+            {
+              "name": "nightsfrom",
+              "value": "={{$('Парсинг ответа Claude').first().json.searchParams.nightsfrom}}"
+            },
+            {
+              "name": "nightsto",
+              "value": "={{$('Парсинг ответа Claude').first().json.searchParams.nightsto}}"
+            },
+            {
+              "name": "adults",
+              "value": "={{$('Парсинг ответа Claude').first().json.searchParams.adults}}"
+            },
+            {
+              "name": "children",
+              "value": "={{$('Парсинг ответа Claude').first().json.searchParams.children}}"
+            },
+            {
+              "name": "budget",
+              "value": "={{$('Парсинг ответа Claude').first().json.searchParams.budget_total}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Поиск через Веб (Claude)",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2000, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{$env.CLAUDE_API_KEY}}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "claude-sonnet-4-20250514"
+            },
+            {
+              "name": "max_tokens",
+              "value": "3000"
+            },
+            {
+              "name": "tools",
+              "value": "[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}]"
+            },
+            {
+              "name": "system",
+              "value": "Ты эксперт по поиску туров. Найди актуальные туры на Level.Travel, Travelata, Tourvisor.ru по параметрам. Используй веб-поиск. Соблюдай критерии: Google 4.7+, Booking 9.0+, Tripadvisor 4.7+. Верни список туров в формате JSON: [{hotelname, stars, region, price, flydate, nights, meal, operator, rating_booking, rating_google, tourlink, why_top}]"
+            },
+            {
+              "name": "messages",
+              "value": "=[{\"role\":\"user\",\"content\":\"Найди туры: {{ JSON.stringify($('Парсинг ответа Claude').first().json.searchParams) }}\"}]"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Claude — Формирует ответ с турами",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2250, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{$env.CLAUDE_API_KEY}}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "model", "value": "claude-sonnet-4-20250514" },
+            { "name": "max_tokens", "value": "2000" },
+            {
+              "name": "system",
+              "value": "=ВСТАВЬ_СЮДА_СИСТЕМНЫЙ_ПРОМПТ (тот же что и в основном агенте)"
+            },
+            {
+              "name": "messages",
+              "value": "=[{\"role\":\"user\",\"content\":\"Вот результаты поиска туров: {{ $json.tours || $json.content }}\\n\\nОформи красивый ответ клиенту по критериям из промпта. ТЗ клиента: {{ JSON.stringify($('Парсинг ответа Claude').first().json.searchParams) }}\"}]"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Отправить в ВК",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2500, 200],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.vk.com/method/messages.send",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "user_id", "value": "={{$('Парсинг ответа Claude').first().json.userId.replace('vk_', '')}}" },
+            { "name": "message", "value": "={{$json.agentText || $json.content[0].text}}" },
+            { "name": "access_token", "value": "={{$env.VK_TOKEN}}" },
+            { "name": "v", "value": "5.131" },
+            { "name": "random_id", "value": "={{Date.now()}}" }
+          ]
+        },
+        "notes": "Добавь в env n8n:\nVK_TOKEN = токен сообщества ВК\n(Управление сообществом → Работа с API → Ключи доступа)"
+      }
+    },
+    {
+      "name": "Отправить в Макс",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2500, 400],
+      "parameters": {
+        "method": "POST",
+        "url": "https://botapi.max.ru/messages/send",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{$env.MAX_BOT_TOKEN}}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "user_id", "value": "={{$('Парсинг ответа Claude').first().json.userId.replace('max_', '')}}" },
+            { "name": "text", "value": "={{$json.agentText || $json.content[0].text}}" }
+          ]
+        },
+        "notes": "Добавь в env n8n:\nMAX_BOT_TOKEN = токен бота из dev.max.ru"
+      }
+    },
+    {
+      "name": "Клиент принял решение?",
+      "type": "n8n-nodes-base.if",
+      "position": [2750, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$('Парсинг ответа Claude').first().json.isDecision}}",
+              "value2": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Карточка менеджеру в ВК",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [3000, 200],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.vk.com/method/messages.send",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "user_id", "value": "={{$env.MANAGER_VK_ID}}" },
+            { "name": "message", "value": "={{$('Парсинг ответа Claude').first().json.agentText}}" },
+            { "name": "access_token", "value": "={{$env.VK_TOKEN}}" },
+            { "name": "v", "value": "5.131" },
+            { "name": "random_id", "value": "={{Date.now()}}" }
+          ]
+        },
+        "notes": "Карточка летит менеджеру в ВК личным сообщением.\nMANAGER_VK_ID — ID страницы менеджера."
+      }
+    }
+  ]
+}
